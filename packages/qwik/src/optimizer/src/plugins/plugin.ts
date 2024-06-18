@@ -367,54 +367,6 @@ export function createPlugin(optimizerOptions: OptimizerOptions = {}) {
 
       debug(`transformedOutput.clear()`);
       transformedOutputs.clear();
-
-      const mode =
-        opts.target === 'lib' ? 'lib' : opts.buildMode === 'development' ? 'dev' : 'prod';
-      const transformOpts: TransformFsOptions = {
-        srcDir,
-        rootDir: opts.rootDir,
-        vendorRoots,
-        entryStrategy: opts.entryStrategy,
-        minify: 'simplify',
-        transpileTs: true,
-        transpileJsx: true,
-        explicitExtensions: true,
-        preserveFilenames: true,
-        mode,
-        scope: opts.scope ? opts.scope : undefined,
-        sourceMaps: opts.sourcemap,
-      };
-
-      if (opts.target === 'client') {
-        transformOpts.stripCtxName = SERVER_STRIP_CTX_NAME;
-        transformOpts.stripExports = SERVER_STRIP_EXPORTS;
-        transformOpts.isServer = false;
-      } else if (opts.target === 'ssr') {
-        transformOpts.stripCtxName = CLIENT_STRIP_CTX_NAME;
-        transformOpts.stripEventHandlers = true;
-        transformOpts.isServer = true;
-        transformOpts.regCtxName = REG_CTX_NAME;
-      }
-
-      const result = await optimizer.transformFs(transformOpts);
-      for (const output of result.modules) {
-        const key = normalizePath(path.join(srcDir, output.path)!);
-        debug(`buildStart() add transformedOutput`, key, output.hook?.displayName);
-        transformedOutputs.set(key, [output, key]);
-        ssrTransformedOutputs.set(key, [output, key]);
-        if (opts.target === 'client' && output.isEntry) {
-          ctx.emitFile({
-            id: key,
-            type: 'chunk',
-            preserveSignature: 'allow-extension',
-          });
-        }
-      }
-
-      diagnosticsCallback(result.diagnostics, optimizer, srcDir);
-
-      results.set('@buildStart', result);
-      ssrResults.set('@buildStart', result);
     }
   };
 
@@ -561,6 +513,42 @@ export function createPlugin(optimizerOptions: OptimizerOptions = {}) {
     const parsedId = parseId(id);
     const path = getPath();
     id = normalizePath(parsedId.pathId);
+
+    if (/(^|\/)entry_[^/]*$/.test(id)) {
+      // TODO every non-hook entry needs to be merged and needs to wait until everything loaded
+      // Wait until all modules are loaded and all hooks are known
+      let found;
+      const seen = new Set<string>();
+      const timer = setInterval(
+        // eslint-disable-next-line no-console
+        () => console.log('Qwik plugin waiting for all code parsing to complete (deadlock?)'),
+        60000
+      );
+      do {
+        found = false;
+        await Promise.all(
+          [...ctx.getModuleIds()].map((mId) => {
+            if (/(^|\/)entry_[^/]*$/.test(mId)) {
+              // don't wait for any entry modules
+              return;
+            }
+            const module = ctx.getModuleInfo(id);
+            if (!module || module.isExternal || module.code || seen.has(id)) {
+              return;
+            }
+            found = true;
+            seen.add(id);
+            console.log(`LOAD ${id} waiting for ${mId}`);
+            return ctx.load({ ...module, resolveDependencies: true });
+          })
+        );
+      } while (found);
+      clearInterval(timer);
+      console.log(`LOAD ${id} done waiting`);
+
+      // TODO
+      // return contents;
+    }
 
     const transformedModule = isSSR ? ssrTransformedOutputs.get(id) : transformedOutputs.get(id);
 
@@ -859,7 +847,7 @@ export const manifest = ${JSON.stringify(manifest)};\n`;
 }
 
 const insideRoots = (ext: string, dir: string, srcDir: string | null, vendorRoots: string[]) => {
-  if (ext !== '.js') {
+  if (!(ext === '.js' || ext === '.mjs' || ext === '.cjs')) {
     return false;
   }
   if (srcDir != null && dir.startsWith(srcDir)) {
