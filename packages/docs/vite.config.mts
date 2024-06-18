@@ -112,7 +112,7 @@ export default defineConfig(async () => {
           ],
         },
       }),
-      qwikVite(),
+      qwikVite({ debug: true, entryStrategy: { type: 'single' } }),
       partytownVite({
         dest: resolve('dist', '~partytown'),
       }),

@@ -11,7 +11,6 @@ import type {
   Optimizer,
   OptimizerOptions,
   QwikManifest,
-  TransformFsOptions,
   TransformModule,
   TransformModuleInput,
   TransformModulesOptions,
@@ -330,6 +329,7 @@ export function createPlugin(optimizerOptions: OptimizerOptions = {}) {
     }
   };
 
+  const qrlEntryIds = new Map<string, Set<string>>();
   const buildStart = async (ctx: Rollup.PluginContext) => {
     debug(`buildStart()`, opts.buildMode, opts.scope, opts.target);
     const optimizer = getOptimizer();
@@ -345,9 +345,7 @@ export function createPlugin(optimizerOptions: OptimizerOptions = {}) {
     if (generatePreManifest) {
       const path = getPath();
 
-      let srcDir = '/';
       if (typeof opts.srcDir === 'string') {
-        srcDir = normalizePath(opts.srcDir);
         debug(`buildStart() srcDir`, opts.srcDir);
       } else if (Array.isArray(opts.srcInputs)) {
         optimizer.sys.getInputFiles = async (rootDir) =>
@@ -360,13 +358,10 @@ export function createPlugin(optimizerOptions: OptimizerOptions = {}) {
           });
         debug(`buildStart() opts.srcInputs (${opts.srcInputs.length})`);
       }
-      const vendorRoots = opts.vendorRoots;
-      if (vendorRoots.length > 0) {
-        debug(`vendorRoots`, vendorRoots);
-      }
 
       debug(`transformedOutput.clear()`);
       transformedOutputs.clear();
+      qrlEntryIds.clear();
     }
   };
 
@@ -514,8 +509,9 @@ export function createPlugin(optimizerOptions: OptimizerOptions = {}) {
     const path = getPath();
     id = normalizePath(parsedId.pathId);
 
-    if (/(^|\/)entry_[^/]*$/.test(id)) {
-      // TODO every non-hook entry needs to be merged and needs to wait until everything loaded
+    const qrlEntry = qrlEntryIds.get(id);
+    if (qrlEntry) {
+      // every non-hook entry needs to be merged and needs to wait until everything loaded
       // Wait until all modules are loaded and all hooks are known
       let found;
       const seen = new Set<string>();
@@ -526,28 +522,30 @@ export function createPlugin(optimizerOptions: OptimizerOptions = {}) {
       );
       do {
         found = false;
+        console.log('entry', id, qrlEntry.entries());
         await Promise.all(
           [...ctx.getModuleIds()].map((mId) => {
-            if (/(^|\/)entry_[^/]*$/.test(mId)) {
-              // don't wait for any entry modules
+            if (qrlEntryIds.has(mId)) {
+              // don't wait for any other entry modules
               return;
             }
-            const module = ctx.getModuleInfo(id);
-            if (!module || module.isExternal || module.code || seen.has(id)) {
+            const module = ctx.getModuleInfo(mId);
+            if (!module || module.isExternal || module.code || seen.has(mId) || qrlEntry.has(mId)) {
+              console.log('not waiting for', mId, module, seen.has(mId), qrlEntry.has(mId));
               return;
             }
             found = true;
-            seen.add(id);
-            console.log(`LOAD ${id} waiting for ${mId}`);
-            return ctx.load({ ...module, resolveDependencies: true });
+            seen.add(mId);
+            console.log(`LOAD ${id} waiting for ${mId}`, module, transformedOutputs.get(id));
+            return ctx.load(module);
           })
         );
+        // // wait just a little longer to get more modules loaded
+        await new Promise((resolve) => setTimeout(resolve, 50000));
       } while (found);
       clearInterval(timer);
-      console.log(`LOAD ${id} done waiting`);
-
-      // TODO
-      // return contents;
+      console.log(`LOAD ${id} done waiting`, transformedOutputs.get(id));
+      // At this point the entry module should be loaded and merged
     }
 
     const transformedModule = isSSR ? ssrTransformedOutputs.get(id) : transformedOutputs.get(id);
@@ -679,7 +677,17 @@ export function createPlugin(optimizerOptions: OptimizerOptions = {}) {
       for (const mod of newOutput.modules) {
         if (mod !== module) {
           const key = normalizePath(path.join(srcDir, mod.path));
-          currentOutputs.set(key, [mod, id]);
+          console.log('transform() segment ', key, mod.path, mod.isEntry, mod.hook);
+          if (currentOutputs.has(key) && mod.isEntry && !mod.hook) {
+            // We need to merge same-name entry modules. They only contain re-exports
+            currentOutputs.set(key, [
+              // during dev mode this would just keep growing but there are no entries in dev mode
+              { ...mod, code: currentOutputs.get(key)![0].code + mod.code },
+              id,
+            ]);
+          } else {
+            currentOutputs.set(key, [mod, id]);
+          }
           deps.add(key);
           // rollup must be told about entry points
           if (opts.target === 'client' && mod.isEntry) {
@@ -688,6 +696,11 @@ export function createPlugin(optimizerOptions: OptimizerOptions = {}) {
               type: 'chunk',
               preserveSignature: 'allow-extension',
             });
+            if (!mod.hook) {
+              const qrlEntry = qrlEntryIds.get(id) || new Set<string>();
+              qrlEntry.add(id);
+              qrlEntryIds.set(key, qrlEntry);
+            }
           }
           ctx.addWatchFile(key);
         }
@@ -697,9 +710,9 @@ export function createPlugin(optimizerOptions: OptimizerOptions = {}) {
       // unchanged imports are not missing in our internal transform cache
       // This can happen in the repl when the plugin is re-initialized
       // and possibly in other places
-      for (const id of deps.values()) {
-        await ctx.load({ id });
-      }
+      // for (const id of deps.values()) {
+      //   await ctx.load({ id });
+      // }
 
       return {
         code: module.code,

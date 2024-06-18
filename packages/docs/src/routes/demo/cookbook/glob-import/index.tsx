@@ -10,7 +10,7 @@ const metaGlobComponents: Record<string, any> = import.meta.glob(
   '/src/routes/demo/cookbook/glob-import/examples/*',
   {
     import: 'default',
-    eager: isDev ? false : true,
+    eager: true,
   }
 );
 
